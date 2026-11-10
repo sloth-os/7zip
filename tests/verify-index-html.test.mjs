@@ -17,10 +17,12 @@ function t(name, fn) {
   catch (e) { console.log('FAIL - ' + name + '\n       ' + e.message); fail++; }
 }
 
-// The 25 contract ids: the original 20, the feature-detected native picker
-// buttons added for PWA file handling, and the three selective-extraction
-// additions (select-all checkbox + the two "selected entries" buttons).
-const CONTRACT_IDS = ['dropzone','file-input','btn-open-archive','status-line','progress-output','archive-panel',
+// The 27 contract ids: the original 20, the feature-detected native picker
+// buttons added for PWA file handling, the three selective-extraction
+// additions (select-all checkbox + the two "selected entries" buttons), and
+// the two folder-compress intake additions (Select folder… button + hidden
+// webkitdirectory input).
+const CONTRACT_IDS = ['dropzone','file-input','folder-input','btn-open-archive','btn-add-folder','status-line','progress-output','archive-panel',
   'archive-name','entry-select-all','entries-body','btn-extract-all','btn-extract-selected','btn-extract-folder',
   'btn-extract-selected-folder','btn-test-archive','compress-panel',
   'compress-list','format-select','level-select','password-input','btn-compress','downloads',
@@ -36,7 +38,7 @@ for (const m of appjs.matchAll(/querySelector(?:All)?\(\s*['"]([^'"]+)['"]\s*\)/
 
 // 1. ID contract
 t('every contract id defined exactly once in index.html', () => {
-  assert.equal(CONTRACT_IDS.length, 25, 'contract id list must hold 25 ids');
+  assert.equal(CONTRACT_IDS.length, 27, 'contract id list must hold 27 ids');
   for (const id of CONTRACT_IDS) {
     assert.equal(htmlIds.filter(x => x === id).length, 1, 'id ' + id);
   }
@@ -118,11 +120,19 @@ t('panels + install btn hidden initially', () => {
   assert.match(html, /<button id="install-btn"[^>]*\bhidden\b/);
   assert.ok(/hidden/.test(html.match(/<input id="file-input"[^>]*>/)[0]), 'file-input not hidden');
 });
-t('#dropzone is click/drag target; #file-input type=file multiple', () => {
+t('#dropzone is click/drag target; #file-input type=file multiple; #folder-input adds webkitdirectory', () => {
   assert.match(html, /<div id="dropzone"[^>]*role="button"[^>]*tabindex="0"/);
   const fi = html.match(/<input id="file-input"[^>]*>/)[0];
   assert.match(fi, /type="file"/);
   assert.match(fi, /\bmultiple\b/);
+  const fo = html.match(/<input id="folder-input"[^>]*>/);
+  assert.ok(fo, 'folder-input missing');
+  assert.match(fo[0], /type="file"/);
+  assert.match(fo[0], /\bwebkitdirectory\b/);
+  assert.match(fo[0], /\bmultiple\b/);
+  assert.match(fo[0], /\bhidden\b/);
+  assert.ok(html.indexOf('<input id="folder-input"') > html.indexOf('<input id="file-input"'),
+    'folder-input must follow file-input');
 });
 t('#progress-output is a <pre>; #status-line exists', () => {
   assert.match(html, /<pre id="progress-output"/);
@@ -181,21 +191,31 @@ t('both selection buttons ship type=button + class btn + aria-label + disabled; 
   assert.equal(html.match(/<button id="btn-extract-selected"[^>]*>([^<]*)</)[1], 'Extract selected');
   assert.equal(html.match(/<button id="btn-extract-selected-folder"[^>]*>([^<]*)</)[1], 'Selected to folder…');
 });
-t('only install-btn and the three feature-gated buttons ship hidden (nothing else got hidden)', () => {
+t('only install-btn and the four feature-gated buttons ship hidden (nothing else got hidden)', () => {
   const hidden = [...html.matchAll(/<button\b[^>]*\bhidden\b[^>]*>/g)]
     .map(m => (m[0].match(/id="([^"]+)"/) || [])[1])
     .filter(Boolean);
-  assert.deepEqual(hidden.sort(), ['btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'install-btn']);
+  assert.deepEqual(hidden.sort(), ['btn-add-folder', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'install-btn']);
 });
-t('.dz-actions row wraps #btn-open-archive and follows #file-input inside the dropzone section', () => {
+t('.dz-actions row wraps #btn-open-archive then #btn-add-folder and follows #file-input inside the dropzone section', () => {
   const sec = html.match(/<section aria-label="File drop zone">([\s\S]*?)<\/section>/);
   assert.ok(sec, 'dropzone section missing');
   assert.ok(sec[1].indexOf('<p class="dz-actions">') > sec[1].indexOf('<input id="file-input"'),
     '.dz-actions must come after the #file-input line');
   const row = sec[1].match(/<p class="dz-actions">([\s\S]*?)<\/p>/);
   assert.ok(row, '.dz-actions paragraph not closed');
-  assert.equal((row[1].match(/<button\b/g) || []).length, 1, '.dz-actions must hold exactly one button');
+  assert.equal((row[1].match(/<button\b/g) || []).length, 2, '.dz-actions must hold exactly two buttons');
   assert.ok(row[1].includes('id="btn-open-archive"'), 'btn-open-archive not inside .dz-actions');
+  assert.ok(row[1].includes('id="btn-add-folder"'), 'btn-add-folder not inside .dz-actions');
+  assert.ok(row[1].indexOf('id="btn-open-archive"') < row[1].indexOf('id="btn-add-folder"'),
+    'btn-add-folder must follow btn-open-archive');
+  const add = html.match(/<button id="btn-add-folder"[^>]*>([^<]*)</);
+  assert.ok(add, 'btn-add-folder button missing');
+  assert.match(add[0], /type="button"/);
+  assert.match(add[0], /\bhidden\b/, 'must ship hidden (feature-detected at boot)');
+  assert.match(add[0], /class="btn"/);
+  assert.match(add[0], /aria-label="[^"]{10,}"/);
+  assert.equal(add[1], 'Select folder…');
 });
 t('.panel-actions button order is the 5-button contract order', () => {
   const panel = html.match(/<section id="archive-panel"[\s\S]*?<div class="panel-actions">([\s\S]*?)<\/div>/);

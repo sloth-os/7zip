@@ -10,12 +10,13 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const FILE = ROOT + '/index.html';
 const html = readFileSync(FILE, 'utf8');
 
-// The 25 contract ids: the original 20, the two feature-detected native
-// picker buttons (Open archive… / Extract to folder…) and the three
+// The 27 contract ids: the original 20, the two feature-detected native
+// picker buttons (Open archive… / Extract to folder…), the three
 // selective-extraction additions (select-all checkbox + the two
-// "selected entries" buttons).
+// "selected entries" buttons), and the two folder-compress intake additions
+// (Select folder… button + hidden webkitdirectory input).
 const EXPECTED_IDS = [
-  'dropzone', 'file-input', 'btn-open-archive', 'status-line', 'progress-output',
+  'dropzone', 'file-input', 'folder-input', 'btn-open-archive', 'btn-add-folder', 'status-line', 'progress-output',
   'archive-panel', 'archive-name', 'entry-select-all', 'entries-body',
   'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-test-archive',
   'compress-panel', 'compress-list', 'format-select', 'level-select', 'password-input', 'btn-compress',
@@ -126,9 +127,9 @@ check('dark + light themes via prefers-color-scheme', () => {
 });
 
 // ---- DOM ID contract -------------------------------------------------------
-check('all 25 contract ids defined exactly once, no extra ids', () => {
+check('all 27 contract ids defined exactly once, no extra ids', () => {
   const found = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
-  assert.equal(EXPECTED_IDS.length, 25, 'contract id list must hold 25 ids');
+  assert.equal(EXPECTED_IDS.length, 27, 'contract id list must hold 27 ids');
   for (const id of EXPECTED_IDS) {
     assert.equal(found.filter(x => x === id).length, 1, `id "${id}" must appear exactly once`);
   }
@@ -139,7 +140,12 @@ check('all 25 contract ids defined exactly once, no extra ids', () => {
 check('#dropzone present with exact instruction text; #file-input type=file multiple hidden', () => {
   const dz = tagWithId('div', 'dropzone');
   assert.ok(dz, 'dropzone div missing');
-  assert.ok(html.includes('Drop an archive to inspect/extract, or drop files to compress'), 'instruction text missing');
+  assert.ok(html.includes('Drop an archive to inspect/extract, or drop files or folders to compress'), 'instruction text missing');
+  assert.match(
+    dz[0],
+    /aria-label="Drop an archive to inspect or extract, or drop files or folders to compress\. Activates a file chooser\."/,
+    'dropzone aria-label must mention folders and the file chooser'
+  );
   const fi = tagWithId('input', 'file-input');
   assert.ok(fi, 'file-input missing');
   assert.match(fi[0], /type="file"/);
@@ -167,6 +173,37 @@ check('#btn-open-archive: hidden .btn inside a .dz-actions row after #file-input
   assert.match(btn[0], /\bhidden\b/, 'must ship hidden — app.js unhides it only when showOpenFilePicker exists');
   assert.match(btn[0], /class="btn"/);
   assert.match(btn[0], /aria-label="[^"]{10,}"/);
+});
+
+check('#btn-add-folder: hidden .btn after #btn-open-archive inside the .dz-actions row', () => {
+  const row = /<p class="dz-actions">([\s\S]*?)<\/p>/.exec(html);
+  assert.ok(row, '.dz-actions paragraph missing');
+  const openIdx = row[1].indexOf('id="btn-open-archive"');
+  const addIdx = row[1].indexOf('id="btn-add-folder"');
+  assert.ok(openIdx >= 0 && addIdx >= 0, 'both picker buttons must live in .dz-actions');
+  assert.ok(addIdx > openIdx, 'btn-add-folder must follow btn-open-archive');
+  const btn = tagWithId('button', 'btn-add-folder');
+  assert.ok(btn, 'btn-add-folder button missing');
+  assert.match(btn[0], /type="button"/);
+  assert.match(btn[0], /\bhidden\b/, 'must ship hidden — app.js unhides it only when a folder intake API exists');
+  assert.match(btn[0], /class="btn"/);
+  assert.match(btn[0], /aria-label="[^"]{10,}"/);
+  const m = /<button[^>]*\bid="btn-add-folder"[^>]*>([^<]*)<\/button>/.exec(html);
+  assert.ok(m, 'btn-add-folder has no simple text body');
+  assert.equal(m[1], 'Select folder…');
+});
+
+check('#folder-input: hidden file input with webkitdirectory + multiple, directly after #file-input', () => {
+  const fi = tagWithId('input', 'folder-input');
+  assert.ok(fi, 'folder-input missing');
+  assert.match(fi[0], /type="file"/);
+  assert.match(fi[0], /\bwebkitdirectory\b/, 'legacy folder intake needs the webkitdirectory attribute');
+  assert.match(fi[0], /\bmultiple\b/);
+  assert.match(fi[0], /\bhidden\b/);
+  const idxFile = html.indexOf('<input id="file-input"');
+  const idxFolder = html.indexOf('<input id="folder-input"');
+  assert.ok(idxFile >= 0, '#file-input missing');
+  assert.ok(idxFolder > idxFile, '#folder-input must follow #file-input');
 });
 
 check('#btn-extract-folder: hidden .btn between #btn-extract-all and #btn-test-archive in .panel-actions', () => {
@@ -345,7 +382,7 @@ check('#btn-clear is a button', () => {
 });
 
 check('all buttons have type="button"', () => {
-  for (const id of ['install-btn', 'btn-clear', 'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'btn-test-archive', 'btn-compress']) {
+  for (const id of ['install-btn', 'btn-clear', 'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'btn-add-folder', 'btn-test-archive', 'btn-compress']) {
     const tag = tagWithId('button', id);
     assert.ok(tag, `${id} missing`);
     assert.match(tag[0], /type="button"/, `${id} lacks type="button"`);

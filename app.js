@@ -60,7 +60,36 @@
   var queue = []; // serialized outbound requests
   var busy = false;
 
+  // queuedFiles holds ArrayBuffers BY DESIGN: the compress protocol resends
+  // every file's bytes on every Compress click (see the transferCopy comment),
+  // so the buffers must stay alive between clicks — folder intake can grow
+  // this queue to thousands of files (potentially hundreds of MB of heap).
+  // That cost is inherent to the protocol and deliberately not re-engineered
+  // here; Clear drops the whole queue.
   var queuedFiles = []; // { path, name, size, data: ArrayBuffer } for compress
+  // Empty folders to preserve in the archive: [{ path }]. Only the folder
+  // intake paths can populate this — <input webkitdirectory>'s FileList
+  // cannot express a directory holding no files, so its batches always pass
+  // an empty list. Sent as the compress request's `dirs` field.
+  var queuedDirs = [];
+  // Paths reserved by batches whose file reads are still in flight, tagged
+  // with the generation that reserved them (path -> Set of generations).
+  // queueBatch dedupes against the live queues, but a batch only lands in
+  // them once its async arrayBuffer() reads settle — seconds to minutes for
+  // a folder pick. Without the reservation a second intake of the same tree
+  // (a repeat drop of a folder that is still being read) would pass the
+  // dedupe too, and the worker rejects the WHOLE compress job on a duplicate
+  // input path. The generation tag is what makes a Clear behave: an in-flight
+  // batch caught by Clear is gen-dead (its settle branch drops it), so its
+  // stale tag must NOT dedupe a post-Clear re-pick away — while each batch's
+  // settle removes ONLY its own tag, so a dead batch settling late can never
+  // steal a live batch's reservation.
+  var pendingPaths = new Map(); // path -> Set of generations holding it
+  // First folder root queued since the last Clear: folder intake names the
+  // archive after the folder that was picked (photos → photos.7z). Plain-file
+  // batches leave this null and the old rule (base name of the first queued
+  // file) applies.
+  var archiveBaseHint = null;
   // The currently opened archive: { name, file: File, key: string }. It holds
   // NO bytes — the worker stages them once (stage-once cache) and every later
   // operation references them by `key`, so the main thread keeps only the
@@ -87,9 +116,24 @@
   // guard: a superseded render (or Clear) stops its pending chunk chain.
   var RENDER_CHUNK = 500;
   var renderToken = 0;
+  // Same cancellation guard for the compress list, kept separate from
+  // renderToken because the two lists render independently: every
+  // renderCompressList call (queued batch, Remove click, Clear) bumps it and
+  // stops the superseded chunk chain. A folder pick can queue tens of
+  // thousands of rows, so it needs the identical chunking.
+  var compressRenderToken = 0;
+  // Cap on concurrent file.arrayBuffer() calls while queued batches read:
+  // folder picks routinely bring thousands of files, and one Promise.all over
+  // all of them would hold every read open at once. A sliding window bounds
+  // peak memory while still keeping reads in flight. The cap is GLOBAL, not
+  // per batch — one drop of N folders queues N batches at once, and N separate
+  // windows would multiply the peak by N.
+  var READ_CONCURRENCY = 32;
+  var activeReads = 0; // arrayBuffer() calls in flight across ALL batches
+  var readWaiters = []; // resolve() callbacks waiting for a free read slot
 
   // ------------------------------------------------------------------- dom ---
-  var dropzone, fileInput, statusLine, progressOutput, btnOpenArchive;
+  var dropzone, fileInput, folderInput, statusLine, progressOutput, btnOpenArchive, btnAddFolder;
   var archivePanel, archiveNameEl, entriesBody, btnExtractAll, btnExtractFolder, btnTestArchive;
   var entrySelectAll, btnExtractSelected, btnExtractSelectedFolder;
   var compressPanel, compressList, formatSelect, levelSelect, passwordInput, btnCompress;
@@ -419,6 +463,141 @@
     if (toQueue.length) queueFilesForCompress(toQueue);
   }
 
+  // Promise wrapper for the entry-API file read: entry.file delivers via
+  // callbacks, the walks below are async/await.
+  function entryFilePromise(entry) {
+    return new Promise(function (resolve, reject) {
+      entry.file(resolve, reject);
+    });
+  }
+
+  // Recursively walk a DROPPED directory (WebKit entry API). readEntries
+  // returns at most 100 entries per call, so the loop keeps reading until it
+  // gets an empty batch. Returns the recursive file count; every directory
+  // whose subtree holds no files at all (including one holding only empty
+  // dirs) lands in batch.emptyDirs so the worker can preserve it via the
+  // compress request's dirs field. Paths carry a manually built prefix
+  // because entries expose no fullPath-relative-to-drop-root on their own.
+  async function walkEntryDirRecursive(dirEntry, prefix, batch) {
+    var reader = dirEntry.createReader();
+    var count = 0;
+    for (;;) {
+      var entries = await new Promise(function (resolve, reject) {
+        reader.readEntries(resolve, reject);
+      });
+      if (!entries || !entries.length) break;
+      for (var i = 0; i < entries.length; i++) {
+        var ent = entries[i];
+        if (ent.isFile) {
+          batch.items.push({ file: await entryFilePromise(ent), path: prefix + ent.name });
+          count++;
+        } else if (ent.isDirectory) {
+          var sub = await walkEntryDirRecursive(ent, prefix + ent.name + '/', batch);
+          if (sub === 0) batch.emptyDirs.push(prefix + ent.name);
+          count += sub;
+        }
+      }
+    }
+    return count;
+  }
+
+  async function walkDroppedDirectory(dirEntry) {
+    var batch = { rootName: dirEntry.name, items: [], emptyDirs: [] };
+    var files = await walkEntryDirRecursive(dirEntry, dirEntry.name + '/', batch);
+    // The dropped root itself counts as an empty dir when it holds no files
+    // anywhere — same rule as the picked-folder walk.
+    if (files === 0) batch.emptyDirs.push(dirEntry.name);
+    return batch;
+  }
+
+  // Traverse the entries the drop handler captured synchronously (drop items
+  // are only valid during the drop event itself). Plain files keep the
+  // EXISTING routing — handleIncomingFiles opens the first top-level archive
+  // and queues the rest; directories ALWAYS go to the compress queue, even
+  // when named like an archive (*.zip / *.7z): a dropped directory is never
+  // opened as one. Multiple dropped folders queue one batch each, in drop
+  // order.
+  async function processEntryDrop(captured) {
+    var plainFiles = [];
+    var folderBatches = [];
+    for (var i = 0; i < captured.length; i++) {
+      var c = captured[i];
+      if (!c.entry) {
+        // No entry for this item (or webkitGetAsEntry returned null): the
+        // synchronously captured File is all there is — plain dropped file.
+        if (c.file) plainFiles.push(c.file);
+        continue;
+      }
+      try {
+        if (c.entry.isFile) {
+          var f = await entryFilePromise(c.entry);
+          if (f) plainFiles.push(f);
+        } else if (c.entry.isDirectory) {
+          folderBatches.push(await walkDroppedDirectory(c.entry));
+        }
+      } catch (err) {
+        // Per-item failure: report it, queue NOTHING from that item's batch,
+        // keep whatever the traversal already collected from the others.
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    }
+    if (plainFiles.length) handleIncomingFiles(plainFiles);
+    for (var b = 0; b < folderBatches.length; b++) {
+      queueBatch(folderBatches[b].rootName, folderBatches[b].items, folderBatches[b].emptyDirs);
+    }
+  }
+
+  // Drop intake. DataTransferItems are invalidated once the drop event
+  // handler returns, so EVERY webkitGetAsEntry() call — and the getAsFile()
+  // fallback for entry-less items — must happen synchronously here; the
+  // potentially long directory traversal then runs async over the captures.
+  // Browsers exposing no webkitGetAsEntry anywhere (all modern engines do —
+  // Chrome, Firefox 50+, Safari 11.1+) keep the legacy dt.files behavior.
+  function handleDataTransfer(dt) {
+    var items = dt.items;
+    var captured = null;
+    if (items && typeof items.length === 'number') {
+      var i;
+      var entryApi = false;
+      for (i = 0; i < items.length; i++) {
+        if (items[i] && typeof items[i].webkitGetAsEntry === 'function') {
+          entryApi = true;
+          break;
+        }
+      }
+      if (entryApi) {
+        captured = [];
+        for (i = 0; i < items.length; i++) {
+          var item = items[i];
+          var entry = null;
+          var file = null;
+          if (item) {
+            if (typeof item.webkitGetAsEntry === 'function') {
+              try {
+                entry = item.webkitGetAsEntry();
+              } catch (ignored) {
+                entry = null;
+              }
+            }
+            if (!entry && typeof item.getAsFile === 'function') {
+              try {
+                file = item.getAsFile();
+              } catch (ignored2) {
+                file = null;
+              }
+            }
+          }
+          captured.push({ entry: entry, file: file });
+        }
+      }
+    }
+    if (captured) {
+      processEntryDrop(captured);
+      return;
+    }
+    if (dt.files && dt.files.length) handleIncomingFiles(dt.files);
+  }
+
   function openArchive(file) {
     var gen = generation;
     // The currentArchive object THIS open owns. A second openArchive with no
@@ -442,9 +621,10 @@
         renderEntries([]);
         archiveNameEl.textContent = file.name;
         archivePanel.hidden = false;
-        // Mixed drop: an archive opens while other files queue for compress —
-        // keep the compress panel visible when the queue is not empty.
-        compressPanel.hidden = queuedFiles.length === 0;
+        // Mixed drop: an archive opens while other files/folders queue for
+        // compress — keep the compress panel visible when either queue is not
+        // empty.
+        compressPanel.hidden = queuedFiles.length === 0 && queuedDirs.length === 0;
         // The ONLY byte-carrying request of the whole open/extract lifecycle:
         // pumpQueue transfers `data` (never a copy), so it is DETACHED once
         // dispatched and nothing may retain or resend it — later operations
@@ -626,61 +806,292 @@
     }
   }
 
+  // Legacy plain-files entry point (file input, dt.files drops): a thin
+  // wrapper around the shared batch core, mapping each File to its relative
+  // path — webkitRelativePath when the intake supplied one, else the bare
+  // name (the pre-folder behavior). rootName null: plain-file batches never
+  // set the archive-name hint.
   function queueFilesForCompress(files) {
-    setStatus('Reading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…');
-    Promise.all(
-      files.map(function (file) {
-        return file.arrayBuffer().then(function (data) {
-          return {
-            path: file.webkitRelativePath || file.name,
-            name: file.name,
-            size: data.byteLength,
-            data: data,
-          };
-        });
-      })
-    ).then(
-      function (items) {
-        queuedFiles = queuedFiles.concat(items);
+    queueBatch(
+      null,
+      Array.prototype.slice.call(files || []).map(function (file) {
+        return { file: file, path: file.webkitRelativePath || file.name };
+      }),
+      []
+    );
+  }
+
+  // Reserve/release the paths of a batch whose reads are still in flight, so a
+  // second intake of the same tree dedupes against it (see pendingPaths).
+  // Reservations are TAGGED WITH THE BATCH'S GENERATION: within one generation
+  // at most one batch can hold a path (a same-gen intake dedupes against it),
+  // and Clear kills every in-flight batch's commit — so a stale tag must
+  // neither block a post-Clear re-pick nor be removable by anyone but its own
+  // batch's settle (a dead batch settling late and releasing a LIVE tag would
+  // re-open the duplicate-path window).
+  function reservePaths(paths, gen) {
+    for (var i = 0; i < paths.length; i++) {
+      var gens = pendingPaths.get(paths[i]);
+      if (!gens) {
+        gens = new Set();
+        pendingPaths.set(paths[i], gens);
+      }
+      gens.add(gen);
+    }
+  }
+
+  function releasePaths(paths, gen) {
+    for (var i = 0; i < paths.length; i++) {
+      var gens = pendingPaths.get(paths[i]);
+      if (!gens) continue;
+      gens.delete(gen);
+      if (!gens.size) pendingPaths.delete(paths[i]);
+    }
+  }
+
+  // Shared core for EVERY compress intake path (plain files, folder picker,
+  // webkitdirectory input, dropped folders). items: [{ file, path }];
+  // emptyDirs: relative paths of file-less directories to preserve;
+  // rootName: folder root for archive naming (null for plain-file batches).
+  function queueBatch(rootName, items, emptyDirs) {
+    // A Clear while this batch is reading must stay cleared: its bytes are
+    // exactly what the purge drops, and committing them afterwards would
+    // resurrect the queue, the panel and the naming hint behind the user's
+    // back. Captured before the first await, checked in BOTH settle branches.
+    var gen = generation;
+    // Dedupe by path against everything already queued, everything an in-flight
+    // batch has reserved, AND within the batch itself: the worker rejects
+    // duplicate input paths outright, and folder picks trivially overlap an
+    // earlier pick of the same tree (or a loose file whose path matches one
+    // inside the folder).
+    var seen = new Set();
+    var i;
+    for (i = 0; i < queuedFiles.length; i++) seen.add(queuedFiles[i].path);
+    for (i = 0; i < queuedDirs.length; i++) seen.add(queuedDirs[i].path);
+    pendingPaths.forEach(function (gens, path) {
+      // Only LIVE-generation reservations dedupe: an older tag belongs to a
+      // batch a Clear already killed — it can never commit, so its paths must
+      // stay available to a re-pick instead of being skipped as "duplicates".
+      if (gens.has(gen)) seen.add(path);
+    });
+    var survivors = [];
+    var batchDirs = [];
+    var skipped = 0;
+    for (i = 0; i < items.length; i++) {
+      if (seen.has(items[i].path)) {
+        skipped++;
+        continue;
+      }
+      seen.add(items[i].path);
+      survivors.push(items[i]);
+    }
+    var dirs = emptyDirs || [];
+    for (i = 0; i < dirs.length; i++) {
+      if (seen.has(dirs[i])) {
+        skipped++;
+        continue;
+      }
+      seen.add(dirs[i]);
+      batchDirs.push(dirs[i]);
+    }
+    if (!survivors.length && !batchDirs.length && !skipped) return;
+
+    // Reserved BEFORE the reads start and released in both settle branches:
+    // the queue itself only sees these paths once the reads are done.
+    var reserved = [];
+    for (i = 0; i < survivors.length; i++) reserved.push(survivors[i].path);
+    for (i = 0; i < batchDirs.length; i++) reserved.push(batchDirs[i]);
+    reservePaths(reserved, gen);
+
+    // Same wording as the legacy reader, with N = post-dedupe survivor count
+    // (identical to files.length on the plain-files path, which never dupes).
+    if (survivors.length) {
+      setStatus('Reading ' + survivors.length + ' file' + (survivors.length > 1 ? 's' : '') + '…');
+    }
+    readBatchBounded(survivors).then(
+      function (buffers) {
+        releasePaths(reserved, gen);
+        if (gen !== generation) return; // cleared while reading: drop the batch
+        for (var j = 0; j < survivors.length; j++) {
+          queuedFiles.push({
+            path: survivors[j].path,
+            name: baseName(survivors[j].path),
+            size: buffers[j].byteLength,
+            data: buffers[j],
+          });
+        }
+        for (var k = 0; k < batchDirs.length; k++) {
+          queuedDirs.push({ path: batchDirs[k] });
+        }
+        // Archive naming: the first folder root queued since the last Clear
+        // wins; later batches (and plain-file batches) never overwrite it.
+        if (archiveBaseHint === null && rootName) archiveBaseHint = rootName;
         renderCompressList();
-        setStatus(
+        compressPanel.hidden = queuedFiles.length === 0 && queuedDirs.length === 0;
+        var text =
           queuedFiles.length +
-            ' file' +
-            (queuedFiles.length > 1 ? 's' : '') +
-            ' queued for compression'
-        );
+          ' file' +
+          (queuedFiles.length > 1 ? 's' : '') +
+          ' queued for compression';
+        if (skipped > 0) {
+          text += ' (' + skipped + ' duplicate' + (skipped > 1 ? 's' : '') + ' skipped)';
+        }
+        setStatus(text);
       },
       function (err) {
+        releasePaths(reserved, gen);
+        if (gen !== generation) return; // a Clear already reset the status line
+        // Read failure queues NOTHING from this batch — the legacy
+        // all-or-nothing Promise.all semantics, preserved.
         setStatus(err && err.message ? err.message : String(err), true);
       }
     );
   }
 
-  function renderCompressList() {
-    compressList.textContent = '';
-    var frag = document.createDocumentFragment();
-    queuedFiles.forEach(function (item, index) {
-      var li = document.createElement('li');
-
-      var label = document.createElement('span');
-      label.textContent = item.path + ' — ' + humanSize(item.size);
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn';
-      removeBtn.textContent = 'Remove';
-      removeBtn.setAttribute('aria-label', 'Remove ' + item.name + ' from the list');
-      removeBtn.addEventListener('click', function () {
-        queuedFiles.splice(index, 1);
-        renderCompressList();
+  // Read every survivor's bytes with bounded concurrency: at most
+  // READ_CONCURRENCY arrayBuffer() calls in flight at any moment, counted
+  // ACROSS every batch (see the READ_CONCURRENCY comment). Results land in item
+  // order regardless of completion order; any single read rejection fails the
+  // whole batch (legacy all-or-nothing semantics) and still frees its slot.
+  function readBatchBounded(items) {
+    var buffers = new Array(items.length);
+    var next = 0;
+    // One read, slot already held. Releases the slot on EVERY outcome — before
+    // recursing, and also when arrayBuffer() itself throws synchronously — so
+    // no permit can leak and wedge the gate for the rest of the session.
+    function readOne(index) {
+      var reading;
+      try {
+        reading = items[index].file.arrayBuffer();
+      } catch (syncErr) {
+        releaseReadSlot();
+        return Promise.reject(syncErr);
+      }
+      return Promise.resolve(reading).then(
+        function (data) {
+          releaseReadSlot();
+          buffers[index] = data;
+          return lane();
+        },
+        function (err) {
+          releaseReadSlot();
+          throw err;
+        }
+      );
+    }
+    function lane() {
+      if (next >= items.length) return Promise.resolve();
+      var index = next++;
+      // A free slot is taken synchronously, so a batch's first window of reads
+      // opens in the same task that queued it; only a gated lane defers, and it
+      // defers on the permit queue (no timer).
+      if (activeReads < READ_CONCURRENCY) {
+        activeReads++;
+        return readOne(index);
+      }
+      return new Promise(function (resolve) {
+        readWaiters.push(resolve);
+      }).then(function () {
+        return readOne(index);
       });
-
-      li.appendChild(label);
-      li.appendChild(removeBtn);
-      frag.appendChild(li);
+    }
+    var lanes = [];
+    var width = Math.min(READ_CONCURRENCY, items.length);
+    for (var w = 0; w < width; w++) lanes.push(lane());
+    return Promise.all(lanes).then(function () {
+      return buffers;
     });
-    compressList.appendChild(frag);
-    compressPanel.hidden = queuedFiles.length === 0;
+  }
+
+  // Hand the freed slot straight to the longest-waiting gated lane (keeping
+  // activeReads unchanged) or give it back to the pool.
+  function releaseReadSlot() {
+    var waiter = readWaiters.shift();
+    if (waiter) waiter();
+    else activeReads--;
+  }
+
+  // Chunked compress-list render — mirrors renderEntries exactly: first
+  // RENDER_CHUNK rows synchronous, remaining chunks one per setTimeout(0)
+  // tick, compressRenderToken cancels superseded chains (Clear, a Remove
+  // click or the next queued batch all bump it). File rows first in queue
+  // order, then the empty-folder rows.
+  function renderCompressList() {
+    var token = ++compressRenderToken;
+    // Snapshot both queues: rows stream in over several ticks while Remove
+    // buttons splice the LIVE arrays — but every splice re-renders (new
+    // token, new snapshot), so an in-flight chain can never append rows
+    // whose captured indices no longer match the arrays they would splice.
+    var fileRows = queuedFiles.slice();
+    var dirRows = queuedDirs.slice();
+    var total = fileRows.length + dirRows.length;
+    compressList.textContent = '';
+    compressPanel.hidden = total === 0;
+    if (!total) return;
+    var index = 0;
+    function buildChunk() {
+      var frag = document.createDocumentFragment();
+      var end = Math.min(index + RENDER_CHUNK, total);
+      for (; index < end; index++) {
+        frag.appendChild(
+          index < fileRows.length
+            ? buildCompressFileRow(fileRows[index], index)
+            : buildCompressDirRow(dirRows[index - fileRows.length], index - fileRows.length)
+        );
+      }
+      compressList.appendChild(frag);
+    }
+    buildChunk();
+    (function schedule() {
+      if (index >= total) return;
+      // setTimeout only (no requestAnimationFrame — same rule as
+      // renderEntries); the token check IS the cancellation mechanism.
+      setTimeout(function () {
+        if (token !== compressRenderToken) return;
+        buildChunk();
+        schedule();
+      }, 0);
+    })();
+  }
+
+  // Compress-row builders. The Remove closure captures its index at build
+  // time — the DOM contract offers no dataset attributes and no
+  // querySelectorAll, so the closure is the only handle back to the queued
+  // item. File rows splice queuedFiles, folder rows splice queuedDirs.
+  function buildCompressFileRow(item, index) {
+    var li = document.createElement('li');
+    var label = document.createElement('span');
+    label.textContent = item.path + ' — ' + humanSize(item.size);
+    var removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'btn';
+    removeBtn.textContent = 'Remove';
+    removeBtn.setAttribute('aria-label', 'Remove ' + item.name + ' from the list');
+    removeBtn.addEventListener('click', function () {
+      queuedFiles.splice(index, 1);
+      renderCompressList();
+    });
+    li.appendChild(label);
+    li.appendChild(removeBtn);
+    return li;
+  }
+
+  function buildCompressDirRow(dir, index) {
+    var li = document.createElement('li');
+    var label = document.createElement('span');
+    label.textContent = dir.path + ' — empty folder';
+    var removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'btn';
+    removeBtn.textContent = 'Remove';
+    removeBtn.setAttribute('aria-label', 'Remove folder ' + dir.path + ' from the list');
+    removeBtn.addEventListener('click', function () {
+      queuedDirs.splice(index, 1);
+      renderCompressList();
+    });
+    li.appendChild(label);
+    li.appendChild(removeBtn);
+    return li;
   }
 
   // -------------------------------------------------------------- downloads ---
@@ -886,6 +1297,84 @@
       });
   }
 
+  // "Select folder…" for compress. mode 'read' — unlike the extract flows,
+  // nothing is ever written back into the picked tree. The picker call stays
+  // synchronous with the click (transient user activation); the walk and the
+  // byte reads happen after it resolves.
+  function onAddFolder() {
+    window
+      .showDirectoryPicker({ mode: 'read', id: '7zip-compress', startIn: 'documents' })
+      .then(function (dirHandle) {
+        return walkPickedDirectory(dirHandle);
+      })
+      .then(function (batch) {
+        queueBatch(batch.rootName, batch.items, batch.emptyDirs);
+      })
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') return; // picker dismissed
+        // Walk failure (getFile / permission): nothing from this batch was
+        // queued — queueBatch only runs after the walk completed.
+        setStatus(err && err.message ? err.message : String(err), true);
+      });
+  }
+
+  // Recursively walk the picked directory handle. Unlike <input
+  // webkitdirectory>, this API can SEE empty directories — they are collected
+  // separately so the worker can preserve them in the archive. Returns the
+  // recursive file count; paths are prefixed with the root name so the
+  // archive keeps the picked folder as its top-level directory.
+  async function walkDirHandleRecursive(dirHandle, prefix, batch) {
+    var count = 0;
+    for await (var pair of dirHandle.entries()) {
+      var name = pair[0];
+      var handle = pair[1];
+      if (handle.kind === 'file') {
+        batch.items.push({ file: await handle.getFile(), path: prefix + name });
+        count++;
+      } else if (handle.kind === 'directory') {
+        var sub = await walkDirHandleRecursive(handle, prefix + name + '/', batch);
+        // A directory holding no files anywhere (including one holding only
+        // empty dirs) needs an explicit dirs entry — no file implies it.
+        if (sub === 0) batch.emptyDirs.push(prefix + name);
+        count += sub;
+      }
+    }
+    return count;
+  }
+
+  async function walkPickedDirectory(dirHandle) {
+    var batch = { rootName: dirHandle.name, items: [], emptyDirs: [] };
+    var files = await walkDirHandleRecursive(dirHandle, dirHandle.name + '/', batch);
+    // The picked root itself follows the same rule as any other directory.
+    if (files === 0) batch.emptyDirs.push(dirHandle.name);
+    return batch;
+  }
+
+  // Legacy fallback intake: <input webkitdirectory>. The FileList carries
+  // files only (no empty directories — that loss is inherent to the API),
+  // each with a webkitRelativePath whose first segment is the folder root.
+  function onFolderInputChange() {
+    var files = Array.prototype.slice.call(folderInput.files || []);
+    if (files.length) {
+      var rootName = null;
+      for (var i = 0; i < files.length; i++) {
+        var rel = files[i] && files[i].webkitRelativePath;
+        if (rel) {
+          rootName = String(rel).split('/')[0];
+          break;
+        }
+      }
+      queueBatch(
+        rootName,
+        files.map(function (file) {
+          return { file: file, path: file.webkitRelativePath || file.name };
+        }),
+        []
+      );
+    }
+    folderInput.value = ''; // allow re-selecting the same folder
+  }
+
   // ------------------------------------------------------------ operations ---
 
   function onTestArchive() {
@@ -1016,8 +1505,8 @@
   }
 
   function onCompress() {
-    if (!queuedFiles.length) {
-      setStatus('Nothing to compress — drop some files first', true);
+    if (!queuedFiles.length && !queuedDirs.length) {
+      setStatus('Nothing to compress — drop files or folders first', true);
       return;
     }
     var gen = generation;
@@ -1027,12 +1516,30 @@
     // No encrypt-headers checkbox in the DOM contract: headers are encrypted
     // whenever a password is set and the format is 7z.
     var encryptHeaders = !!password && format === '7z';
-    var archiveName = baseName(queuedFiles[0].name) + '.' + format;
+    // Folder intake names the archive after the first folder root queued
+    // since the last Clear; plain-file batches keep the old rule (base name
+    // of the first queued file), and a dirs-only batch falls back to the
+    // first empty folder's own name.
+    var archiveName =
+      (archiveBaseHint ||
+        baseName(queuedFiles.length ? queuedFiles[0].name : queuedDirs[0].path)) +
+      '.' + format;
 
-    setStatus('Compressing ' + queuedFiles.length + ' file' + (queuedFiles.length > 1 ? 's' : '') + '…');
+    // A dirs-only batch (an empty folder pick) counts folders instead —
+    // 'Compressing 0 file…' for a real request would read as a bug.
+    setStatus(
+      queuedFiles.length
+        ? 'Compressing ' + queuedFiles.length + ' file' + (queuedFiles.length > 1 ? 's' : '') + '…'
+        : 'Compressing ' + queuedDirs.length + ' folder' + (queuedDirs.length > 1 ? 's' : '') + '…'
+    );
     sendRequest('compress', {
       files: queuedFiles.map(function (f) {
         return { path: f.path, data: f.data };
+      }),
+      // Empty folders to preserve inside the archive. ALWAYS an array — the
+      // worker treats [] exactly like the legacy no-dirs request.
+      dirs: queuedDirs.map(function (d) {
+        return d.path;
       }),
       archiveName: archiveName,
       format: format,
@@ -1066,8 +1573,10 @@
     busy = false;
 
     queuedFiles = [];
+    queuedDirs = [];
+    archiveBaseHint = null; // folder naming hint belongs to the cleared batch
     currentArchive = null;
-    renderCompressList();
+    renderCompressList(); // also bumps compressRenderToken: pending chunks stop
     renderEntries([]);
     archivePanel.hidden = true;
     compressPanel.hidden = true;
@@ -1287,7 +1796,7 @@
       dropzone.classList.remove('dragover');
       var dt = ev.dataTransfer;
       if (!dt) return;
-      if (dt.files && dt.files.length) handleIncomingFiles(dt.files);
+      handleDataTransfer(dt);
     });
     // Never let stray drops on the page navigate away.
     ['dragover', 'drop'].forEach(function (type) {
@@ -1302,9 +1811,11 @@
   function boot() {
     dropzone = $('dropzone');
     fileInput = $('file-input');
+    folderInput = $('folder-input');
     statusLine = $('status-line');
     progressOutput = $('progress-output');
     btnOpenArchive = $('btn-open-archive');
+    btnAddFolder = $('btn-add-folder');
     archivePanel = $('archive-panel');
     archiveNameEl = $('archive-name');
     entriesBody = $('entries-body');
@@ -1371,6 +1882,25 @@
       btnExtractFolder.hidden = false;
       btnExtractSelectedFolder.addEventListener('click', onExtractSelectedToFolder);
       btnExtractSelectedFolder.hidden = false;
+    }
+    // Folder intake for compress, feature-detected in two tiers: the File
+    // System Access walk wins where available (it is the only path that can
+    // SEE empty directories — <input webkitdirectory>'s FileList carries
+    // files alone), the legacy folder input is the fallback, and elsewhere
+    // the button stays hidden. Both refs are null-guarded so boot survives
+    // DOMs lacking the folder-intake chrome (mirrors the statusLine /
+    // passwordInput guards).
+    if (btnAddFolder && folderInput) {
+      if (typeof window.showDirectoryPicker === 'function') {
+        btnAddFolder.addEventListener('click', onAddFolder);
+        btnAddFolder.hidden = false;
+      } else if ('webkitdirectory' in folderInput) {
+        btnAddFolder.addEventListener('click', function () {
+          folderInput.click();
+        });
+        folderInput.addEventListener('change', onFolderInputChange);
+        btnAddFolder.hidden = false;
+      }
     }
 
     updateNetStatus();

@@ -452,17 +452,18 @@
 
   <main>
     <section aria-label="File drop zone">
-      <div id="dropzone" role="button" tabindex="0" aria-label="Drop an archive to inspect or extract, or drop files to compress. Activates a file chooser.">
+      <div id="dropzone" role="button" tabindex="0" aria-label="Drop an archive to inspect or extract, or drop files or folders to compress. Activates a file chooser.">
         <svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
           <path d="M21 8v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/>
           <rect x="2" y="3.5" width="20" height="4.5" rx="1"/>
           <path d="M10 12.5h4"/>
         </svg>
-        <p class="dz-title">Drop an archive to inspect/extract, or drop files to compress</p>
+        <p class="dz-title">Drop an archive to inspect/extract, or drop files or folders to compress</p>
         <p class="dz-sub">…or click anywhere in this box to browse. 7-Zip runs locally via WebAssembly — your files never leave your device.</p>
       </div>
       <input id="file-input" type="file" multiple hidden>
-      <p class="dz-actions"><button id="btn-open-archive" type="button" class="btn" aria-label="Open an archive with the native file picker" hidden>Open archive…</button></p>
+      <input id="folder-input" type="file" webkitdirectory multiple hidden>
+      <p class="dz-actions"><button id="btn-open-archive" type="button" class="btn" aria-label="Open an archive with the native file picker" hidden>Open archive…</button> <button id="btn-add-folder" type="button" class="btn" aria-label="Select a folder to compress" hidden>Select folder…</button></p>
     </section>
 
     <p id="status-line" role="status" aria-live="polite"></p>
