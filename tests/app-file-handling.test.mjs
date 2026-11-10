@@ -932,7 +932,7 @@ section('(5) Extract to folder… (showDirectoryPicker + containment)');
   const ARC_BYTES = enc.encode('archive-bytes');
   const listMsg = await openArchiveViaInput(world, 'test.7z', ARC_BYTES, 'application/x-7z-compressed');
   check('(5) list request for test.7z reached the worker', !!listMsg);
-  check('(5) the extract request carries a copy of the archive bytes',
+  check('(5) the list request carries the archive bytes',
     !!listMsg && bytesEq(new Uint8Array(listMsg.archive.data), ARC_BYTES));
   world.reply({
     id: listMsg.id,
@@ -957,10 +957,11 @@ section('(5) Extract to folder… (showDirectoryPicker + containment)');
     world.status() === 'Extracting "test.7z" to folder…', JSON.stringify(world.status()));
 
   const extractMsg = world.lastMsgOfType('extract');
-  check('(5) extract request carries archive name + bytes and no password',
-    extractMsg.archive.name === 'test.7z' &&
-    bytesEq(new Uint8Array(extractMsg.archive.data), ARC_BYTES) &&
-    extractMsg.password === undefined);
+  check('(5) extract request carries the staged archiveKey, no bytes and no password',
+    extractMsg.archiveKey === listMsg.archiveKey &&
+    extractMsg.archive === undefined &&
+    extractMsg.password === undefined,
+    JSON.stringify({ key: extractMsg.archiveKey, listKey: listMsg.archiveKey, hasArchive: extractMsg.archive !== undefined }));
 
   // Hostile + normal paths through safeExtractPath semantics.
   const DATA = {
@@ -1457,9 +1458,10 @@ function selToggle(world, box, on) {
     JSON.stringify(selMsg && selMsg.paths));
   check('(8a) the selection travels as "paths", NEVER as "files" (pumpQueue would treat files as transferables)',
     !!selMsg && selMsg.files === undefined && Array.isArray(selMsg.paths));
-  check('(8a) archive name + bytes ride along exactly like in the extract-all flow, password untouched',
-    !!selMsg && selMsg.archive.name === 'test.7z' &&
-    bytesEq(new Uint8Array(selMsg.archive.data), ARC) && selMsg.password === undefined);
+  check('(8a) the staged archiveKey rides along instead of bytes, password untouched',
+    !!selMsg && selMsg.archiveKey === listMsg.archiveKey &&
+    selMsg.archive === undefined && selMsg.password === undefined,
+    JSON.stringify(selMsg && { key: selMsg.archiveKey, listKey: listMsg.archiveKey, hasArchive: selMsg.archive !== undefined }));
   world.reply({ id: selMsg.id, type: 'extract-result', files: [] });
   check('(8a) zero files -> pinned plural error status "Nothing extracted from the 3 selected entries"',
     await waitFor(() => world.status() === 'Nothing extracted from the 3 selected entries') && world.isError(),
@@ -1502,10 +1504,10 @@ function selToggle(world, box, on) {
     'status=' + JSON.stringify(world.status()));
   const sel2 = (await waitFor(() => world.msgOfType('extract').length >= 2))
     ? world.lastMsgOfType('extract') : null;
-  check('(8a) second request carries sorted ["a.txt","b.txt"] and the typed password like the existing flow',
+  check('(8a) second request carries sorted ["a.txt","b.txt"], the typed password and the staged key',
     !!sel2 && deepEq(sel2.paths, ['a.txt', 'b.txt']) && sel2.password === 'hunter2' &&
-    sel2.archive.name === 'test.7z' && bytesEq(new Uint8Array(sel2.archive.data), ARC),
-    JSON.stringify(sel2 && { paths: sel2.paths, password: sel2.password }));
+    sel2.archiveKey === listMsg.archiveKey && sel2.archive === undefined,
+    JSON.stringify(sel2 && { paths: sel2.paths, password: sel2.password, key: sel2.archiveKey }));
   const DATA = { 'a.txt': new Uint8Array([1, 2, 3]), 'b.txt': new Uint8Array([4, 5]) };
   world.reply({
     id: sel2.id,
@@ -1610,11 +1612,11 @@ function selToggle(world, box, on) {
 
   const gotExtract = await waitFor(() => world.workerMessages.some((m) => m.msg.type === 'extract'));
   const msg = world.lastMsgOfType('extract');
-  check('(8c) extract request carries the sorted selection paths, archive bytes and no files field',
+  check('(8c) extract request carries the sorted selection paths, the staged archiveKey and no files field',
     gotExtract && deepEq(msg.paths, ['a.txt', 'b.txt']) && msg.files === undefined &&
-    msg.archive.name === 'test.7z' && bytesEq(new Uint8Array(msg.archive.data), ARC) &&
+    msg.archiveKey === listMsg.archiveKey && msg.archive === undefined &&
     msg.password === undefined,
-    JSON.stringify(msg && msg.paths));
+    JSON.stringify(msg && { paths: msg.paths, key: msg.archiveKey }));
   check('(8c) status is the pinned "to folder" variant',
     world.status() === 'Extracting 2 selected entries from "test.7z" to folder…',
     JSON.stringify(world.status()));

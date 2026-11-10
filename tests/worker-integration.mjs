@@ -256,7 +256,7 @@ await runScenario('list the archive -> entries match names/sizes', async () => {
   if (res.response.type === 'error') throw new Error('worker error: ' + res.response.message);
   const entries = res.response.entries;
   assert(Array.isArray(entries), 'entries is an array');
-  assert(typeof res.response.raw === 'string' && res.response.raw.includes('----------'), 'raw output included');
+  assert(res.response.raw === undefined, 'list-result no longer carries raw');
   const files = entries.filter((e) => !e.isFolder);
   const byPath = new Map(files.map((e) => [e.path, e]));
   assert(files.length === 2, `exactly 2 file entries (got ${files.length}: ${files.map((e) => e.path)})`);

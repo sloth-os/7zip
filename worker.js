@@ -2,19 +2,44 @@
  * worker.js — 7-Zip WebAssembly engine worker (classic Worker script, no modules).
  *
  * Speaks the binding WORKER MESSAGE PROTOCOL with app.js:
- *   main -> worker: {id,type:'init'} | {id,type:'list'|'extract'|'test',archive:{name,data},password?}
+ *   main -> worker: {id,type:'init'}
+ *                   | {id,type:'list',archive:{name,data},archiveKey,password?}   (staging)
+ *                   | {id,type:'extract'|'test',archiveKey,password?,paths?}      (keyed)
+ *                   | {id,type:'list'|'extract'|'test',archive:{name,data},password?,paths?}
  *                   | {id,type:'compress',files:[{path,data}],archiveName,format,level,password?,encryptHeaders}
+ *                   | {type:'evict'}                                              (no id)
  *   worker -> main: {id,type:'ready'|'progress'|'list-result'|'extract-result'|'compress-result'|'test-result'|'error',...}
+ *
+ * STAGE-ONCE ARCHIVE CACHE. A 'list' that carries BOTH a non-empty
+ * 'archiveKey' string and archive bytes stages those bytes PERSISTENTLY under
+ * /arc/<seq>/<name> (never inside /job<id>) and remembers the parsed listing
+ * with them (unless it is too big for the coverage index to ever consult). Later 'extract'/'test' requests reference the same key and carry
+ * NO bytes at all: the engine reads the staged file in place, so a big archive
+ * is copied into MEMFS exactly once per open instead of once per operation.
+ * Staging a new key evicts every previously staged archive first, so worker
+ * MEMFS holds at most ONE archive copy at any time. '{type:'evict'}' (sent by
+ * Clear, fire-and-forget: it carries no id and gets NO reply) drops the whole
+ * store immediately. A keyed request whose key is unknown — never staged,
+ * evicted, or lost with a restarted worker — answers
+ * {type:'error', message:'extract: unknown archiveKey'} (or 'test: …'), which
+ * app.js turns into a transparent re-stage + one retry.
+ * The LEGACY byte form (archive:{name,data}, no archiveKey) keeps working
+ * unchanged for all three ops: it stages into /job<id>/in, caches nothing and
+ * evicts nothing.
  *
  * 'extract' additionally accepts an OPTIONAL paths:[string,...] field — entry
  * paths exactly as the 'l -slt' listing returned them — restricting the job to
  * that selection (FILTERED / FULL modes + post-filter, see runExtractJob).
  * Absent, null or empty paths keep the unfiltered full-extraction behavior.
  *
+ * 'list-result' carries ONLY {id,type,entries} — the raw 'l -slt' text used to
+ * ride along but nothing ever read it ('test-result' keeps its raw tail).
+ *
  * The engine is single-threaded: exactly one job runs at a time; messages that
  * arrive during init or while another job is running are queued in order.
  * Every job lives in /job<id>/in and /job<id>/out and is removed recursively
- * when the job finishes (success OR failure).
+ * when the job finishes (success OR failure); /arc is job-independent and
+ * survives until eviction.
  *
  * Node-testable by contract: uses ONLY self.onmessage, self.postMessage,
  * importScripts, self.location, fetch, console and JS built-ins.
@@ -37,6 +62,28 @@
   // budget stays far below that; over-budget selections simply run FULL
   // extraction + post-filter instead (identical results, only slower).
   var MAX_FILTER_ARGV_BYTES = 512 * 1024;
+  // Listings bigger than this are NOT indexed for the coverage-fallback
+  // decision (see allUncoveredProvablyEmpty below): building the file/ancestor
+  // form sets costs one pass over every entry with up to four string forms
+  // each, and past this size the index build could cost more than the FULL
+  // re-run it might save. Over-cap listings keep the unconditional re-run
+  // behavior (and are not retained — see runListJob).
+  var COVERAGE_INDEX_MAX_ENTRIES = 65536;
+
+  // ------------------------------------------------- stage-once archive store ---
+  // Persistent MEMFS root for staged archives, deliberately OUTSIDE /job<id>
+  // so withJob's cleanup never touches it. At most ONE archive lives here at a
+  // time (a new staging list evicts all others first), which bounds worker
+  // memory at one archive copy instead of one copy per operation.
+  //
+  // MEMORY CONSEQUENCE: while an archive is open the worker holds ONE copy of
+  // its bytes (e.g. 185 MB) until Clear or the next open. That is a strict
+  // reduction versus the old always-re-stage protocol, where the main thread
+  // permanently held currentArchive.data (185 MB) PLUS every operation paid a
+  // 185 MB slice copy in app.js PLUS a fresh 185 MB MEMFS write in the worker.
+  // Now the main thread keeps only the (disk-backed) File reference and MEMFS
+  // holds one copy in total.
+  var ARC_ROOT = '/arc';
 
   // ---------------------------------------------------------------- state ---
   var Module = null; // emscripten Module, set once init resolves
@@ -46,6 +93,11 @@
   var pumping = false;
   var activeJobId = null; // job id whose output print()/printErr() route to
   var logLines = []; // output lines of the current callMain invocation
+  // archiveKey (caller-generated opaque string) -> staged record
+  // { dir, path, name, size, listing: Array|null }. The key is only ever a Map
+  // key, never a path component: /arc/<stagedSeq>/ holds the bytes.
+  var stagedArchives = new Map();
+  var stagedSeq = 0;
 
   // ------------------------------------------------------------- plumbing ---
 
@@ -291,6 +343,8 @@
   }
 
   // Run fn inside a fresh /job<id> tree; always cleans up; never rejects.
+  // Cleanup is strictly scoped to /job<id>: the persistent /arc store survives
+  // every job (keyed jobs still create an unused /job<id>/in).
   function withJob(msg, fn) {
     var id = msg.id;
     var jobDir = '/job' + id;
@@ -326,24 +380,106 @@
     return arcPath;
   }
 
+  // Drop every staged archive (bytes AND cache). Called before staging a new
+  // one and by the fire-and-forget {type:'evict'} message.
+  function evictAllStaged(FS) {
+    removeTree(FS, ARC_ROOT);
+    stagedArchives.clear();
+  }
+
+  // A 'list' stages persistently only when it carries BOTH a usable key and
+  // bytes. Every other combination stays on the legacy path (and a 'list'
+  // never reports an unknown-key error: it is the request that CREATES keys).
+  function isStagingListRequest(msg) {
+    return (
+      typeof msg.archiveKey === 'string' &&
+      msg.archiveKey !== '' &&
+      !!msg.archive &&
+      msg.archive.data !== undefined &&
+      msg.archive.data !== null
+    );
+  }
+
+  // Resolve the archive a job runs against (archiveKey wins over inline bytes):
+  //   1. archiveKey present (not undefined/null) -> KEYED mode: use the staged
+  //      file IN PLACE (no copy — copying would defeat the whole cache; 'l',
+  //      't' and 'x' only ever read the archive and write under /job<id>/out,
+  //      and the sole chdir user, compress, never touches staged archives).
+  //      A key that is not a non-empty string, was never staged, was evicted
+  //      or whose file vanished answers '<op>: unknown archiveKey', which
+  //      app.js recovers from by re-staging and retrying once. Bytes carried
+  //      alongside a key are IGNORED.
+  //   2. otherwise -> LEGACY mode: stage msg.archive into /job<id>/in exactly
+  //      as before (no cache, no eviction).
+  // Returns { arcPath, listing } — listing is the cached parsed 'l -slt' array
+  // of a successful keyed list, or null.
+  function resolveArchive(FS, inDir, msg, op) {
+    if (msg.archiveKey !== undefined && msg.archiveKey !== null) {
+      var rec =
+        typeof msg.archiveKey === 'string' && msg.archiveKey !== ''
+          ? stagedArchives.get(msg.archiveKey)
+          : undefined;
+      if (!rec) throw new Error(op + ': unknown archiveKey');
+      try {
+        FS.stat(rec.path); // defensive: /arc outlives jobs, but verify anyway
+      } catch (vanished) {
+        stagedArchives.delete(msg.archiveKey);
+        throw new Error(op + ': unknown archiveKey');
+      }
+      return { arcPath: rec.path, listing: rec.listing };
+    }
+    return { arcPath: stageArchive(FS, inDir, msg.archive), listing: null };
+  }
+
   function runListJob(msg) {
     return withJob(msg, function (id, jobDir, inDir, outDir, FS) {
-      var arcPath = stageArchive(FS, inDir, msg.archive);
+      var arcPath;
+      var rec = null;
+      if (isStagingListRequest(msg)) {
+        // STAGE-ONCE: evict everything else BEFORE writing these bytes, so
+        // peak MEMFS stays at one archive plus this job's outputs.
+        evictAllStaged(FS);
+        var dir = ARC_ROOT + '/' + ++stagedSeq;
+        FS.mkdirTree(dir);
+        arcPath = dir + '/' + safeBaseName(msg.archive.name, 'archive.bin');
+        var bytes = toU8(msg.archive.data);
+        FS.writeFile(arcPath, bytes);
+        // Registered only after the write succeeded; on an engine failure the
+        // BYTES REMAIN (they were always re-sendable before) and listing stays
+        // null, so a later keyed extract keeps today's fallback behavior.
+        rec = {
+          dir: dir,
+          path: arcPath,
+          name: msg.archive.name,
+          size: bytes.byteLength,
+          listing: null,
+        };
+        stagedArchives.set(msg.archiveKey, rec);
+      } else {
+        arcPath = stageArchive(FS, inDir, msg.archive);
+      }
       var args = ['l', '-slt', arcPath, '-bd'].concat(passwordArgs(msg));
       var r = run7z(args);
       if (r.crashed || r.rc >= 2) throw jobFailure(r, 'Listing archive');
-      post({
-        id: id,
-        type: 'list-result',
-        entries: parseSltListing(r.lines),
-        raw: r.lines.join('\n'),
-      });
+      var entries = parseSltListing(r.lines);
+      // Cached with the bytes it describes — but only while the coverage
+      // fallback can actually consult the cache: allUncoveredProvablyEmpty
+      // bails out unconditionally past COVERAGE_INDEX_MAX_ENTRIES, so
+      // retaining an over-cap parsed array (hundreds of MB in the worker
+      // heap for entry-rich archives, on top of the staged bytes) would be
+      // dead weight for the whole staged session. Over-cap listings keep
+      // listing === null, which the fallback already treats identically
+      // (unconditional FULL re-run).
+      if (rec && entries.length <= COVERAGE_INDEX_MAX_ENTRIES) rec.listing = entries;
+      // No 'raw': nothing ever read the ~700 KB listing text on the main
+      // thread, and structured-cloning it per open was pure overhead.
+      post({ id: id, type: 'list-result', entries: entries });
     });
   }
 
   function runTestJob(msg) {
     return withJob(msg, function (id, jobDir, inDir, outDir, FS) {
-      var arcPath = stageArchive(FS, inDir, msg.archive);
+      var arcPath = resolveArchive(FS, inDir, msg, 'test').arcPath;
       var args = ['t', arcPath, '-bd'].concat(passwordArgs(msg));
       var r = run7z(args);
       post({
@@ -542,10 +678,74 @@
     return true;
   }
 
+  // LISTING-VALIDATED FALLBACK. A FILTERED coverage miss used to trigger a
+  // FULL re-run (complete decompression) unconditionally — even when the
+  // requested paths simply do not exist in the archive or select an empty
+  // directory, which is by far the most common miss (7zz filters match
+  // SILENTLY: rc=0 + 'Everything is Ok' on no-match). When the staged archive
+  // carries a cached listing we can PROVE those requests yield no files and
+  // skip the re-run.
+  //
+  // The index is built from the listing with the SAME 4-form closure
+  // (pathForms) the post-filter uses on found files, plus every strict
+  // ancestor prefix of every form (mirroring markCoveredForm). A requested
+  // path is therefore "maybe present" exactly when the FULL-mode post-filter
+  // could keep a file for it: it matches a listed FILE entry, or it is an
+  // ancestor directory of one, at any depth. Anything else — absent paths, or
+  // a directory tree whose listing holds no file entries (an empty dir) —
+  // provably yields zero kept files, so skipping is result-identical to
+  // re-running (walkOutDir collects regular files only, so both produce the
+  // same empty extract-result).
+  //
+  // Both sides go through selNorm, so backslashes are unified in BOTH
+  // directions; there is no case folding on either side (7z filters are
+  // case-sensitive and requested paths come verbatim from the listing).
+  function buildListingFileIndex(listing) {
+    var fileForms = new Set();
+    var fileAncestors = new Set();
+    for (var i = 0; i < listing.length; i++) {
+      if (listing[i].isFolder) continue; // folders never yield kept files
+      var forms = pathForms(listing[i].path);
+      for (var j = 0; j < forms.length; j++) {
+        fileForms.add(forms[j]);
+        var end = forms[j].length;
+        var slash;
+        while ((slash = forms[j].lastIndexOf('/', end - 1)) > 0) {
+          fileAncestors.add(forms[j].slice(0, slash)); // strict ancestor prefixes
+          end = slash;
+        }
+      }
+    }
+    return { fileForms: fileForms, fileAncestors: fileAncestors };
+  }
+
+  function pathYieldsNoFiles(p, index) {
+    var forms = pathForms(p);
+    for (var j = 0; j < forms.length; j++) {
+      if (index.fileForms.has(forms[j]) || index.fileAncestors.has(forms[j])) return false;
+    }
+    return true; // provably absent, or a directory tree with no file entries
+  }
+
+  // True only when EVERY uncovered requested path provably yields no files.
+  // No cache (legacy list, extract-only flow, failed list) or an over-cap
+  // listing -> false, i.e. today's unconditional FULL re-run. Built lazily,
+  // once per job, and only on a coverage miss.
+  function allUncoveredProvablyEmpty(selected, covered, listing) {
+    if (!listing || listing.length > COVERAGE_INDEX_MAX_ENTRIES) return false;
+    var index = buildListingFileIndex(listing);
+    for (var i = 0; i < selected.length; i++) {
+      if (!covered[i] && !pathYieldsNoFiles(selected[i], index)) return false;
+    }
+    return true;
+  }
+
   function runExtractJob(msg) {
     return withJob(msg, function (id, jobDir, inDir, outDir, FS) {
       var selected = selectedExtractPaths(msg.paths);
-      var arcPath = stageArchive(FS, inDir, msg.archive);
+      var resolved = resolveArchive(FS, inDir, msg, 'extract');
+      var arcPath = resolved.arcPath;
+      var listing = resolved.listing; // cached 'l -slt' entries, or null
       // FILTERED mode (one CLI-filtered invocation) only when EVERY requested
       // path is filter-safe AND the filter argv fits the wasm-stack byte
       // budget (an over-budget argv would overflow the engine's fixed-size
@@ -571,15 +771,20 @@
         if (filteredMode && !selectionCovered(covered)) {
           // COVERAGE FALLBACK: some requested path produced zero files under
           // the CLI filter (filter-matching quirks: basename-only matching,
-          // separator or case mismatches) — re-run ONCE in FULL mode and
-          // apply the same post-filter.
-          removeTree(FS, outDir);
-          FS.mkdirTree(outDir);
-          var rFull = run7z(extractArgs(arcPath, outDir, msg, null));
-          if (rFull.crashed || rFull.rc >= 2) throw jobFailure(rFull, 'Extracting archive');
-          found = [];
-          walkOutDir(FS, outDir, '', found);
-          found = keepSelectedFiles(found, formOwners, covered);
+          // separator or case mismatches — or the path genuinely selects
+          // nothing). Re-run ONCE in FULL mode and apply the same post-filter,
+          // UNLESS the cached listing proves every uncovered request yields no
+          // files at all: then the re-run would decompress the whole archive
+          // to produce exactly the empty result we already have.
+          if (!allUncoveredProvablyEmpty(selected, covered, listing)) {
+            removeTree(FS, outDir);
+            FS.mkdirTree(outDir);
+            var rFull = run7z(extractArgs(arcPath, outDir, msg, null));
+            if (rFull.crashed || rFull.rc >= 2) throw jobFailure(rFull, 'Extracting archive');
+            found = [];
+            walkOutDir(FS, outDir, '', found);
+            found = keepSelectedFiles(found, formOwners, covered);
+          }
         }
       }
 
@@ -748,6 +953,13 @@
               return runCompressJob(msg);
             case 'test':
               return runTestJob(msg);
+            case 'evict':
+              // Fire-and-forget from Clear: drop the staged archive at once.
+              // No id, NO reply — app.js never waits for it (the worker inbox
+              // is sequential, so an evict posted while a job is in flight
+              // still only runs after that job completed).
+              evictAllStaged(Module.FS);
+              return undefined;
             default:
               post({
                 id: msg.id,

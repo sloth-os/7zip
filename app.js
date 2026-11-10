@@ -61,7 +61,12 @@
   var busy = false;
 
   var queuedFiles = []; // { path, name, size, data: ArrayBuffer } for compress
-  var currentArchive = null; // { name, data: ArrayBuffer } currently opened
+  // The currently opened archive: { name, file: File, key: string }. It holds
+  // NO bytes — the worker stages them once (stage-once cache) and every later
+  // operation references them by `key`, so the main thread keeps only the
+  // disk-backed File reference instead of a permanent heap copy.
+  var currentArchive = null;
+  var archiveKeySeq = 0; // monotonic within the page session
   var currentEntries = []; // entries rendered by the last renderEntries call
   var selectedPaths = new Set(); // entry.path strings the user checked
   var entryCheckboxes = []; // row checkbox elements built by the last render
@@ -73,6 +78,15 @@
   // cleared mid-flight never touch the reset UI.
   var generation = 0;
   var staleProgressIds = new Set(); // ids whose progress lines Clear muted
+
+  // Chunked listing render: a huge archive (50k+ entries) must not build every
+  // row in one task — that freezes the UI for seconds. RENDER_CHUNK rows are
+  // built per timer tick; a listing of at most RENDER_CHUNK entries renders
+  // fully synchronously, i.e. indistinguishably from the old behavior.
+  // renderToken is bumped by EVERY renderEntries call and is the cancellation
+  // guard: a superseded render (or Clear) stops its pending chunk chain.
+  var RENDER_CHUNK = 500;
+  var renderToken = 0;
 
   // ------------------------------------------------------------------- dom ---
   var dropzone, fileInput, statusLine, progressOutput, btnOpenArchive;
@@ -124,9 +138,22 @@
   }
 
   // Exact-sized detached copy so the local ArrayBuffer stays usable after
-  // the original is handed to the worker in a transfer list.
+  // the original is handed to the worker in a transfer list. Compress-only:
+  // queuedFiles[i].data is re-sent on every Compress click, so it must NOT be
+  // transferred. The archive hot path transfers its buffer directly instead
+  // (the list request is the only one that carries archive bytes, exactly once
+  // per open) — copying a 185 MB archive per operation was the biggest
+  // single cost of the old protocol.
   function transferCopy(buf) {
     return buf.slice(0);
+  }
+
+  // Opaque per-open key for the worker's stage-once archive cache. Unique
+  // within the page session and used ONLY as a worker-side Map key — never as
+  // a filesystem path component — so it needs no sanitization.
+  function newArchiveKey() {
+    archiveKeySeq += 1;
+    return 'arc-' + Date.now().toString(36) + '-' + archiveKeySeq.toString(36);
   }
 
   function currentPassword() {
@@ -264,7 +291,11 @@
         });
         // Binary payloads travel as ArrayBuffers in the transfer list.
         if (msg.archive && msg.archive.data) {
-          msg.archive = { name: msg.archive.name, data: transferCopy(msg.archive.data) };
+          // The list request is the ONLY message that carries archive bytes,
+          // exactly once per open: transfer the original buffer, never a slice
+          // copy. After dispatch it is detached here and nothing resends it —
+          // every later operation references the worker's staged copy by
+          // archiveKey (see sendStagedRequest).
           transfers.push(msg.archive.data);
         }
         if (Array.isArray(msg.files)) {
@@ -292,6 +323,76 @@
         finishCurrentRequest();
       }
     );
+  }
+
+  // ------------------------------------------------ staged-request plumbing ---
+  //
+  // Every operation except the opening 'list' travels WITHOUT archive bytes:
+  // it names the worker's staged copy by archiveKey. The worker answers
+  // '<op>: unknown archiveKey' when the staged copy is gone — it was evicted by
+  // a newer open, dropped by Clear, or lost with a restarted worker — and this
+  // helper turns that into a transparent recovery: re-read the File, re-stage
+  // it under the SAME key, then retry the original request exactly once.
+
+  function isUnknownKeyError(err) {
+    var m = err && err.message;
+    return m === 'extract: unknown archiveKey' || m === 'test: unknown archiveKey';
+  }
+
+  // requestType: 'extract' | 'test'. arc: the currentArchive object captured at
+  // click time. gen: generation captured at click time. extra: optional plain
+  // fields ({paths:[...]}) — must NOT contain 'archive', 'archiveKey' or
+  // 'files' (msg.files is reserved for compress transferables).
+  //
+  // No deadlock: recovery only runs inside promise callbacks of an
+  // already-settled request (finishCurrentRequest() cleared `busy` before the
+  // rejection microtask runs) and every step goes through sendRequest, i.e.
+  // through the same sequential queue — never a direct worker.postMessage.
+  //
+  // Silent: no status changes. The 'Extracting…'/'Testing…' status set at click
+  // time stays on screen while the re-stage list runs (its progress lines do
+  // flow into the progress pane, which is capped). The re-stage reply's entries
+  // are ignored — the table is NOT re-rendered.
+  function sendStagedRequest(requestType, arc, gen, extra) {
+    var payload = { archiveKey: arc.key, password: currentPassword() };
+    if (extra) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) payload[k] = extra[k];
+      }
+    }
+    return sendRequest(requestType, payload).catch(function (err) {
+      if (!isUnknownKeyError(err)) throw err;
+      // Guarded at EVERY step: a newer open or a Clear abandons the recovery
+      // before it sends anything, so a stale chain can never evict the newer
+      // archive's staging. The abandoned error is flagged so callers stay quiet.
+      if (gen !== generation || arc !== currentArchive) {
+        err.stale = true;
+        throw err;
+      }
+      return arc.file
+        .arrayBuffer() // re-read from disk: the transferred buffer is detached
+        .then(function (data) {
+          if (gen !== generation || arc !== currentArchive) {
+            err.stale = true;
+            throw err;
+          }
+          return sendRequest('list', {
+            archive: { name: arc.name, data: data },
+            archiveKey: arc.key, // SAME key: the caller's payload stays valid
+            password: currentPassword(),
+          });
+        })
+        .then(function () {
+          if (gen !== generation || arc !== currentArchive) {
+            err.stale = true;
+            throw err;
+          }
+          // ONE retry with the identical payload (key-based, holds no buffers).
+          // If it fails too, that error propagates unmodified — no second
+          // recovery, no ping-pong.
+          return sendRequest(requestType, payload);
+        });
+    });
   }
 
   // ----------------------------------------------------- progress + status ---
@@ -332,7 +433,7 @@
       .arrayBuffer()
       .then(function (data) {
         if (gen !== generation) return null;
-        currentArchive = { name: file.name, data: data };
+        currentArchive = { name: file.name, file: file, key: newArchiveKey() };
         owned = currentArchive;
         // The archive just changed hands: drop the PREVIOUS archive's rows
         // and checked selection NOW, before the new listing arrives.
@@ -344,8 +445,15 @@
         // Mixed drop: an archive opens while other files queue for compress —
         // keep the compress panel visible when the queue is not empty.
         compressPanel.hidden = queuedFiles.length === 0;
+        // The ONLY byte-carrying request of the whole open/extract lifecycle:
+        // pumpQueue transfers `data` (never a copy), so it is DETACHED once
+        // dispatched and nothing may retain or resend it — later operations
+        // name the worker's staged copy by archiveKey instead. If this open is
+        // superseded before its list dispatches, the queued list still runs and
+        // stages; the newer open's list then evicts it (self-healing).
         return sendRequest('list', {
-          archive: { name: currentArchive.name, data: currentArchive.data },
+          archive: { name: currentArchive.name, data: data },
+          archiveKey: currentArchive.key,
           password: currentPassword(),
         });
       })
@@ -368,87 +476,129 @@
       });
   }
 
+  // Build ONE entry row. Row state lives in the change-listener closure and in
+  // the index-aligned entryCheckboxes array — the DOM contract offers neither
+  // dataset attributes nor querySelectorAll.
+  function buildRow(entry) {
+    var tr = document.createElement('tr');
+    if (entry.isFolder) tr.className = 'folder';
+
+    // Checkbox column first; folders are selectable too (a selected
+    // directory extracts its whole subtree). The change listener closes
+    // over `entry` directly.
+    var tdSelect = document.createElement('td');
+    tdSelect.className = 'col-select';
+    var checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'entry-select';
+    // Rows built by a LATER chunk must reflect a select-all that already fired:
+    // selectedPaths is the source of truth. On the synchronous path the
+    // selection was just reset, so this is always false.
+    checkbox.checked = selectedPaths.has(entry.path);
+    checkbox.setAttribute('aria-label', 'Select ' + entry.path);
+    checkbox.addEventListener('change', function () {
+      if (checkbox.checked) {
+        selectedPaths.add(entry.path);
+      } else {
+        // A listing MAY contain duplicate paths (legal in e.g. zip). The
+        // Set is keyed by path, so unchecking ONE row must not drop the
+        // shared key while another row with the same path is still checked
+        // — otherwise the UI (a checked row) and the extract payload (path
+        // missing) diverge. entryCheckboxes is index-aligned with
+        // currentEntries; scan it instead of querying the DOM.
+        var stillClaimed = false;
+        for (var k = 0; k < entryCheckboxes.length; k++) {
+          if (entryCheckboxes[k] === checkbox) continue;
+          if (
+            entryCheckboxes[k].checked &&
+            currentEntries[k] &&
+            currentEntries[k].path === entry.path
+          ) {
+            stillClaimed = true;
+            break;
+          }
+        }
+        if (!stillClaimed) selectedPaths.delete(entry.path);
+      }
+      updateSelectionUI();
+    });
+    tdSelect.appendChild(checkbox);
+    entryCheckboxes.push(checkbox);
+
+    var tdName = document.createElement('td');
+    tdName.textContent = entry.isFolder ? entry.path + '/' : entry.path;
+    if (entry.encrypted) tdName.title = 'Encrypted';
+
+    var tdSize = document.createElement('td');
+    tdSize.textContent = entry.isFolder ? '—' : humanSize(entry.size);
+
+    var tdModified = document.createElement('td');
+    tdModified.textContent = entry.modified || '';
+
+    var tdMethod = document.createElement('td');
+    tdMethod.textContent = entry.method || '';
+
+    tr.appendChild(tdSelect);
+    tr.appendChild(tdName);
+    tr.appendChild(tdSize);
+    tr.appendChild(tdModified);
+    tr.appendChild(tdMethod);
+    return tr;
+  }
+
+  // The '(no entries)' placeholder row (5-column span, pinned).
+  function appendPlaceholderRow() {
+    var trEmpty = document.createElement('tr');
+    var tdEmpty = document.createElement('td');
+    tdEmpty.colSpan = 5;
+    tdEmpty.textContent = '(no entries)';
+    trEmpty.appendChild(tdEmpty);
+    entriesBody.appendChild(trEmpty);
+  }
+
+  // Render a listing in RENDER_CHUNK-row slices: the first chunk synchronously,
+  // the rest one per setTimeout(0) tick, so a 50k-entry archive lists without
+  // freezing the UI (the old code built every row — 5 cells plus a checkbox
+  // closure each — in a single task). A listing of at most RENDER_CHUNK entries
+  // takes the synchronous path only: one fragment, one append, one
+  // updateSelectionUI(), i.e. indistinguishable from the unchunked behavior.
   function renderEntries(entries) {
+    var token = ++renderToken;
     // Reset the selection state on every render: the checkboxes, the
     // selected-path set and the cached checkbox list all belong to THIS list.
     currentEntries = entries.slice();
     selectedPaths = new Set();
     entryCheckboxes = [];
     entriesBody.textContent = '';
-    var frag = document.createDocumentFragment();
-    entries.forEach(function (entry) {
-      var tr = document.createElement('tr');
-      if (entry.isFolder) tr.className = 'folder';
-
-      // Checkbox column first; folders are selectable too (a selected
-      // directory extracts its whole subtree). The change listener closes
-      // over `entry` directly — the DOM contract offers neither dataset
-      // attributes nor querySelectorAll.
-      var tdSelect = document.createElement('td');
-      tdSelect.className = 'col-select';
-      var checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.className = 'entry-select';
-      checkbox.setAttribute('aria-label', 'Select ' + entry.path);
-      checkbox.addEventListener('change', function () {
-        if (checkbox.checked) {
-          selectedPaths.add(entry.path);
-        } else {
-          // A listing MAY contain duplicate paths (legal in e.g. zip). The
-          // Set is keyed by path, so unchecking ONE row must not drop the
-          // shared key while another row with the same path is still checked
-          // — otherwise the UI (a checked row) and the extract payload (path
-          // missing) diverge. entryCheckboxes is index-aligned with
-          // currentEntries; scan it instead of querying the DOM.
-          var stillClaimed = false;
-          for (var k = 0; k < entryCheckboxes.length; k++) {
-            if (entryCheckboxes[k] === checkbox) continue;
-            if (
-              entryCheckboxes[k].checked &&
-              currentEntries[k] &&
-              currentEntries[k].path === entry.path
-            ) {
-              stillClaimed = true;
-              break;
-            }
-          }
-          if (!stillClaimed) selectedPaths.delete(entry.path);
-        }
-        updateSelectionUI();
-      });
-      tdSelect.appendChild(checkbox);
-      entryCheckboxes.push(checkbox);
-
-      var tdName = document.createElement('td');
-      tdName.textContent = entry.isFolder ? entry.path + '/' : entry.path;
-      if (entry.encrypted) tdName.title = 'Encrypted';
-
-      var tdSize = document.createElement('td');
-      tdSize.textContent = entry.isFolder ? '—' : humanSize(entry.size);
-
-      var tdModified = document.createElement('td');
-      tdModified.textContent = entry.modified || '';
-
-      var tdMethod = document.createElement('td');
-      tdMethod.textContent = entry.method || '';
-
-      tr.appendChild(tdSelect);
-      tr.appendChild(tdName);
-      tr.appendChild(tdSize);
-      tr.appendChild(tdModified);
-      tr.appendChild(tdMethod);
-      frag.appendChild(tr);
-    });
     if (!entries.length) {
-      var trEmpty = document.createElement('tr');
-      var tdEmpty = document.createElement('td');
-      tdEmpty.colSpan = 5;
-      tdEmpty.textContent = '(no entries)';
-      trEmpty.appendChild(tdEmpty);
-      frag.appendChild(trEmpty);
+      appendPlaceholderRow();
+      updateSelectionUI();
+      return;
     }
-    entriesBody.appendChild(frag);
-    updateSelectionUI();
+    var index = 0;
+    function buildChunk() {
+      var frag = document.createDocumentFragment();
+      var end = Math.min(index + RENDER_CHUNK, entries.length);
+      // Chunks build strictly in order, so entryCheckboxes stays index-aligned
+      // with currentEntries at every point in time.
+      for (; index < end; index++) frag.appendChild(buildRow(currentEntries[index]));
+      entriesBody.appendChild(frag);
+      // Once per chunk: labels and counts stay truthful while rows stream in
+      // (the O(rendered) select-all scan per chunk is negligible).
+      updateSelectionUI();
+    }
+    buildChunk();
+    (function schedule() {
+      if (index >= entries.length) return;
+      // setTimeout only: the test DOM stub has real Node timers but no
+      // requestAnimationFrame. The token check IS the cancellation mechanism —
+      // Clear and a superseding open both bump it, killing this chain.
+      setTimeout(function () {
+        if (token !== renderToken) return;
+        buildChunk();
+        schedule();
+      }, 0);
+    })();
   }
 
   // Selection-derived UI, computed ONLY from selectedPaths and the
@@ -607,11 +757,12 @@
       .showDirectoryPicker({ mode: 'readwrite', id: '7zip-extract', startIn: 'downloads' })
       .then(function (dirHandle) {
         if (gen !== generation) return null;
+        // Captured here (not at click time): the picker may have been open for
+        // a while, and the staged request must name the archive the status line
+        // is about to announce.
+        var arc = currentArchive;
         setStatus('Extracting "' + currentArchive.name + '" to folder…');
-        return sendRequest('extract', {
-          archive: { name: currentArchive.name, data: currentArchive.data },
-          password: currentPassword(),
-        }).then(function (res) {
+        return sendStagedRequest('extract', arc, gen, {}).then(function (res) {
           if (gen !== generation) return null;
           return writeFilesToDirectory(dirHandle, res.files || []);
         });
@@ -627,6 +778,7 @@
       })
       .catch(function (err) {
         if (gen !== generation) return;
+        if (err && err.stale) return; // recovery abandoned: a newer archive owns the UI
         if (err && err.name === 'AbortError') return; // dismissed or permission denied
         setStatus(err && err.message ? err.message : String(err), true);
       });
@@ -739,11 +891,9 @@
   function onTestArchive() {
     if (!currentArchive) return;
     var gen = generation;
+    var arc = currentArchive;
     setStatus('Testing "' + currentArchive.name + '"…');
-    sendRequest('test', {
-      archive: { name: currentArchive.name, data: currentArchive.data },
-      password: currentPassword(),
-    }).then(
+    sendStagedRequest('test', arc, gen, {}).then(
       function (res) {
         if (gen !== generation) return;
         if (res.ok) setStatus('"' + currentArchive.name + '": test passed — archive is OK');
@@ -751,6 +901,7 @@
       },
       function (err) {
         if (gen !== generation) return;
+        if (err && err.stale) return; // recovery abandoned: a newer archive owns the UI
         setStatus(err && err.message ? err.message : String(err), true);
       }
     );
@@ -759,11 +910,9 @@
   function onExtractAll() {
     if (!currentArchive) return;
     var gen = generation;
+    var arc = currentArchive;
     setStatus('Extracting "' + currentArchive.name + '"…');
-    sendRequest('extract', {
-      archive: { name: currentArchive.name, data: currentArchive.data },
-      password: currentPassword(),
-    }).then(
+    sendStagedRequest('extract', arc, gen, {}).then(
       function (res) {
         if (gen !== generation) return;
         var files = res.files || [];
@@ -774,6 +923,7 @@
       },
       function (err) {
         if (gen !== generation) return;
+        if (err && err.stale) return; // recovery abandoned: a newer archive owns the UI
         setStatus(err && err.message ? err.message : String(err), true);
       }
     );
@@ -785,24 +935,22 @@
     return Array.from(selectedPaths).sort();
   }
 
-  // Extract ONLY the checked entries as downloads. Same request shape as
-  // onExtractAll plus the worker protocol's OPTIONAL 'paths' field — never
-  // 'files': pumpQueue treats msg.files as transferable binary payloads.
+  // Extract ONLY the checked entries as downloads. Same staged request shape as
+  // onExtractAll (archiveKey, no bytes) plus the worker protocol's OPTIONAL
+  // 'paths' field — never 'files': pumpQueue treats msg.files as transferable
+  // binary payloads.
   function onExtractSelected() {
     if (!currentArchive) return;
     if (selectedPaths.size === 0) return; // defense-in-depth (button also disabled)
     var gen = generation;
+    var arc = currentArchive;
     var paths = selectedPathsList();
     var n = paths.length;
     setStatus(
       'Extracting ' + n + ' selected ' + (n === 1 ? 'entry' : 'entries') +
         ' from "' + currentArchive.name + '"…'
     );
-    sendRequest('extract', {
-      archive: { name: currentArchive.name, data: currentArchive.data },
-      password: currentPassword(),
-      paths: paths,
-    }).then(
+    sendStagedRequest('extract', arc, gen, { paths: paths }).then(
       function (res) {
         if (gen !== generation) return;
         var files = res.files || [];
@@ -820,6 +968,7 @@
       },
       function (err) {
         if (gen !== generation) return;
+        if (err && err.stale) return; // recovery abandoned: a newer archive owns the UI
         setStatus(err && err.message ? err.message : String(err), true);
       }
     );
@@ -839,15 +988,12 @@
       .showDirectoryPicker({ mode: 'readwrite', id: '7zip-extract-selected', startIn: 'downloads' })
       .then(function (dirHandle) {
         if (gen !== generation) return null;
+        var arc = currentArchive; // captured with the status line it announces
         setStatus(
           'Extracting ' + n + ' selected ' + (n === 1 ? 'entry' : 'entries') +
             ' from "' + currentArchive.name + '" to folder…'
         );
-        return sendRequest('extract', {
-          archive: { name: currentArchive.name, data: currentArchive.data },
-          password: currentPassword(),
-          paths: paths,
-        }).then(function (res) {
+        return sendStagedRequest('extract', arc, gen, { paths: paths }).then(function (res) {
           if (gen !== generation) return null;
           return writeFilesToDirectory(dirHandle, res.files || []);
         });
@@ -863,6 +1009,7 @@
       })
       .catch(function (err) {
         if (gen !== generation) return;
+        if (err && err.stale) return; // recovery abandoned: a newer archive owns the UI
         if (err && err.name === 'AbortError') return; // dismissed or permission denied
         setStatus(err && err.message ? err.message : String(err), true);
       });
@@ -934,6 +1081,43 @@
     progressOutput.textContent = '';
     if (passwordInput) passwordInput.value = '';
     setStatus(initialStatusText);
+    // Purge queued requests that still carry archive BYTES (an open's or a
+    // recovery's staging 'list' waiting behind an in-flight job). pumpQueue
+    // has no generation check, so they would otherwise dispatch AFTER the
+    // evict below: the worker would re-stage a full archive copy this Clear
+    // was supposed to drop — resident in MEMFS with currentArchive === null
+    // until the next open or Clear — and the orphan's 'l -slt' output would
+    // refill the progress pane just emptied (its id is minted after Clear,
+    // so staleProgressIds cannot mute it). Rejecting here is silent: every
+    // consumer gen-checks before touching the UI, and 'Cleared' is not an
+    // unknown-key error, so no recovery is triggered. Keyed extract/test
+    // requests deliberately STAY queued — they carry no bytes and, per the
+    // stage-once design, fail with '<op>: unknown archiveKey' after the
+    // evict, their recovery aborting silently on the generation check.
+    for (var qi = queue.length - 1; qi >= 0; qi--) {
+      if (queue[qi].payload && queue[qi].payload.archive) {
+        queue[qi].reject(new Error('Cleared'));
+        queue.splice(qi, 1);
+      }
+    }
+    // Drop the worker's staged archive copy immediately (the next staging list
+    // would evict it anyway — this is the eager path, that one the backstop for
+    // a lost message). Fire-and-forget BY DESIGN: it bypasses the sendRequest
+    // queue, carries no id and expects no reply, so nothing is awaited and no
+    // round-trip is added. The worker's own inbox is sequential, so an evict
+    // posted while a job is still running only executes after that job
+    // completed — it can never delete a staged archive mid-run. Safe ordering:
+    // `generation` was bumped above, so every callback that could observe the
+    // eviction is already gen-guarded (late results hit the void; queued
+    // post-Clear keyed requests fail with unknown-key and their recovery
+    // aborts silently on the gen check).
+    if (worker) {
+      try {
+        worker.postMessage({ type: 'evict' });
+      } catch (e) {
+        /* worker gone — the next staging list evicts anyway */
+      }
+    }
     pumpQueue();
   }
 
